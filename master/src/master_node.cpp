@@ -1,17 +1,18 @@
 // IRIS FP1 - Master Node (Tahap 2: Odometry + Motion-to-point)
 //
-// Odometry dihitung dari vel_x/vel_y yang dikirim simulasi:
+// Odometry dari vel_x/vel_y yang dikirim simulasi:
 //   heading = atan2(vel_y, vel_x)
 //   x += vel_x * dt,  y += vel_y * dt
 //
-// Kontrol menuju target:
-//   sudut_target = atan2(y_target - y, x_target - x)
-//   error_sudut  = sudut_target - heading   (dinormalisasi ke -pi..pi)
-//   steering     = error_sudut * gain       (clamp ke -90..90)
-//   pwm          = pelan saat error besar atau target sudah dekat
+// Target bisa dinyatakan dua cara:
+//   target_relatif = true  -> (maju, kiri) relatif arah awal mobil  [default]
+//   target_relatif = false -> koordinat dunia
 //
-// Jalankan dengan target:
-//   ros2 run master master_node --ros-args -p target_x:=5.0 -p target_y:=3.0
+// Contoh: 10 meter lurus ke depan
+//   ros2 run master master_node --ros-args -p target_x:=10.0 -p target_y:=0.0
+//
+// Contoh: 8 meter maju, 4 meter ke kiri
+//   ros2 run master master_node --ros-args -p target_x:=8.0 -p target_y:=4.0
 
 #include <algorithm>
 #include <chrono>
@@ -25,7 +26,6 @@
 
 using namespace std::chrono_literals;
 
-// Jaga sudut tetap di rentang -pi..pi
 static double normalize(double a)
 {
   while (a >  M_PI) a -= 2.0 * M_PI;
@@ -42,12 +42,11 @@ public:
                  total_ticks_(0), first_packet_(true),
                  sampai_(false)
   {
-    // --- Target ---
-    target_x_ = this->declare_parameter<double>("target_x", 5.0);
-    target_y_ = this->declare_parameter<double>("target_y", 0.0);
+    target_x_       = this->declare_parameter<double>("target_x", 10.0);
+    target_y_       = this->declare_parameter<double>("target_y", 0.0);
+    target_relatif_ = this->declare_parameter<bool>("target_relatif", true);
 
-    // --- Parameter kontrol ---
-    steering_gain_ = this->declare_parameter<double>("steering_gain", 60.0);
+    steering_gain_ = this->declare_parameter<double>("steering_gain", 30.0);
     pwm_jalan_     = this->declare_parameter<int>("pwm_jalan", 90);
     pwm_min_       = this->declare_parameter<int>("pwm_min", 50);
     toleransi_     = this->declare_parameter<double>("toleransi", 0.5);
@@ -61,7 +60,6 @@ public:
     odom_pub_ = this->create_publisher<geometry_msgs::msg::Pose2D>("/odom_2d", 10);
     cmd_pub_  = this->create_publisher<geometry_msgs::msg::Twist>("/velocity_command", 10);
 
-    // Kirim perintah pada laju tetap, lepas dari laju paket feedback
     control_timer_ = this->create_wall_timer(
       50ms, std::bind(&MasterNode::control, this));
 
@@ -69,7 +67,14 @@ public:
       1s, std::bind(&MasterNode::report, this));
 
     RCLCPP_INFO(this->get_logger(), "Master node aktif (motion-to-point).");
-    RCLCPP_INFO(this->get_logger(), "  target = (%.2f, %.2f)", target_x_, target_y_);
+    if (target_relatif_) {
+      RCLCPP_INFO(this->get_logger(),
+                  "  target relatif: maju %.1f m, kiri %.1f m",
+                  target_x_, target_y_);
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "  target dunia: (%.2f, %.2f)", target_x_, target_y_);
+    }
     RCLCPP_INFO(this->get_logger(), "Menunggu data encoder...");
   }
 
@@ -101,7 +106,7 @@ private:
     last_time_ = now;
     if (dt <= 0.0 || dt > 0.5) return;
 
-    double vx = vel_x_ / 100.0;   // cm/s -> m/s
+    double vx = vel_x_ / 100.0;
     double vy = vel_y_ / 100.0;
 
     x_ += vx * dt;
@@ -130,11 +135,36 @@ private:
   {
     if (first_packet_) return;
 
-    double dx = target_x_ - x_;
-    double dy = target_y_ - y_;
+    // Mobil yang diam tidak punya arah hadap yang bisa dibaca dari
+    // kecepatan. Jadi maju lurus pelan dulu sampai arahnya terbaca,
+    // baru target relatif diterjemahkan ke koordinat dunia.
+    if (target_relatif_ && !target_siap_) {
+      double speed = std::hypot(static_cast<double>(vel_x_),
+                                static_cast<double>(vel_y_));
+      if (speed < 30.0) {
+        kirim(70, 0);
+        return;
+      }
+
+      double maju = target_x_;
+      double kiri = target_y_;
+
+      world_target_x_ = x_ + maju * std::cos(theta_) - kiri * std::sin(theta_);
+      world_target_y_ = y_ + maju * std::sin(theta_) + kiri * std::cos(theta_);
+      target_siap_ = true;
+
+      RCLCPP_INFO(this->get_logger(),
+                  "Arah awal terbaca: %.0f deg. Target dunia = (%.2f, %.2f)",
+                  theta_ * 180.0 / M_PI, world_target_x_, world_target_y_);
+    }
+
+    double tx = target_relatif_ ? world_target_x_ : target_x_;
+    double ty = target_relatif_ ? world_target_y_ : target_y_;
+
+    double dx = tx - x_;
+    double dy = ty - y_;
     jarak_ = std::hypot(dx, dy);
 
-    // Sudah sampai: berhenti dan diam
     if (jarak_ < toleransi_) {
       if (!sampai_) {
         RCLCPP_INFO(this->get_logger(),
@@ -150,24 +180,20 @@ private:
     double sudut_target = std::atan2(dy, dx);
     error_ = normalize(sudut_target - theta_);
 
-    // --- Steering ---
-    double steering = error_ * steering_gain_;
-    steering = std::clamp(steering, -90.0, 90.0);
+    double steering = std::clamp(-error_ * steering_gain_, -90.0, 90.0);
 
-    // --- PWM ---
     int pwm = pwm_jalan_;
 
-    // Pelan kalau harus belok tajam, supaya tidak melebar
+    // Pelan saat harus belok tajam, supaya tidak melebar
     double faktor_belok = 1.0 - std::min(std::fabs(error_) / (M_PI / 2.0), 0.7);
     pwm = static_cast<int>(pwm * faktor_belok);
 
-    // Pelan kalau target sudah dekat
+    // Pelan saat target sudah dekat
     if (jarak_ < jarak_pelan_) {
       pwm = static_cast<int>(pwm * (jarak_ / jarak_pelan_));
     }
 
-    pwm = std::max(pwm, pwm_min_);
-    pwm = std::clamp(pwm, -255, 255);
+    pwm = std::clamp(std::max(pwm, pwm_min_), -255, 255);
 
     kirim(pwm, static_cast<int>(steering));
   }
@@ -187,11 +213,14 @@ private:
   {
     if (first_packet_) return;
 
+    double tx = target_relatif_ ? world_target_x_ : target_x_;
+    double ty = target_relatif_ ? world_target_y_ : target_y_;
+
     RCLCPP_INFO(this->get_logger(),
                 "pos=(%.2f, %.2f) hdg=%.0f | target=(%.1f, %.1f) "
                 "jarak=%.2f m err=%.0f deg | pwm=%d steer=%d%s",
                 x_, y_, theta_ * 180.0 / M_PI,
-                target_x_, target_y_,
+                tx, ty,
                 jarak_, error_ * 180.0 / M_PI,
                 last_pwm_, last_steering_,
                 sampai_ ? "  [SAMPAI]" : "");
@@ -204,6 +233,10 @@ private:
   rclcpp::TimerBase::SharedPtr report_timer_;
 
   double target_x_, target_y_;
+  bool   target_relatif_;
+  bool   target_siap_ = false;
+  double world_target_x_ = 0.0, world_target_y_ = 0.0;
+
   double steering_gain_, toleransi_, jarak_pelan_, min_speed_cms_;
   int pwm_jalan_, pwm_min_;
 
