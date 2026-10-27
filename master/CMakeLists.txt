@@ -23,4 +23,15 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+
+add_executable(master_node src/master_node.cpp)
+ament_target_dependencies(master_node rclcpp std_msgs geometry_msgs)
+
+install(TARGETS master_node
+  DESTINATION lib/${PROJECT_NAME})
+
+
 ament_package()
