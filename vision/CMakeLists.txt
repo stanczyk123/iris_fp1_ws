@@ -27,10 +27,10 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 add_executable(vision_node src/vision_node.cpp)
-ament_target_dependencies(vision_node rclcpp sensor_msgs cv_bridge OpenCV)
-
+ament_target_dependencies(vision_node rclcpp sensor_msgs geometry_msgs cv_bridge OpenCV)
 install(TARGETS vision_node
   DESTINATION lib/${PROJECT_NAME})
 

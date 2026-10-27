@@ -1,9 +1,14 @@
 // IRIS FP1 - Vision Node
 // Step 4: Image Thresholding & Bird-Eye View (BEV)
+// Step 5: Finding Turn Target
 //
-// Subscribe kamera simulasi -> threshold HSV -> warp ke Bird-Eye View.
-// Parameter diatur lewat slider di window "Tuning".
-// Tekan 's' untuk print nilai parameter saat ini, 'q' untuk keluar.
+// Alur: kamera -> threshold HSV -> warp BEV -> cari titik belok
+// Hasil dipublish ke /turn_target (geometry_msgs/Point):
+//   x = posisi target (piksel, 0..lebar BEV)
+//   y = baris lookahead (piksel)
+//   z = 1.0 kalau target valid, 0.0 kalau pakai nilai terakhir
+//
+// Tekan 's' untuk print parameter, 'q' untuk keluar.
 
 #include <memory>
 #include <string>
@@ -11,6 +16,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <geometry_msgs/msg/point.hpp>
 #include <cv_bridge/cv_bridge.hpp>
 
 #include <opencv2/opencv.hpp>
@@ -18,6 +24,7 @@
 namespace
 {
 const std::string CAMERA_TOPIC = "/catvehicle/camera_front/image_raw_front";
+const std::string TARGET_TOPIC = "/turn_target";
 
 const std::string WIN_TUNING = "Tuning";
 const std::string WIN_RAW    = "1 - Raw Camera";
@@ -32,21 +39,27 @@ struct TuningParams
   int v_min, v_max;
   int top_w, bot_w;
   int top_y, bot_y;
+  int look_y;      // posisi pita pencarian, % dari tinggi BEV
+  int band_h;      // tebal pita, % dari tinggi BEV
 };
 
 class VisionNode : public rclcpp::Node
 {
 public:
-  VisionNode() : Node("vision_node"), frame_count_(0)
+  VisionNode() : Node("vision_node"), frame_count_(0),
+                 last_target_x_(-1.0), has_last_target_(false)
   {
     sub_ = this->create_subscription<sensor_msgs::msg::Image>(
       CAMERA_TOPIC, rclcpp::SensorDataQoS(),
       std::bind(&VisionNode::imageCallback, this, std::placeholders::_1));
 
+    pub_ = this->create_publisher<geometry_msgs::msg::Point>(TARGET_TOPIC, 10);
+
     buildTuningWindow();
 
-    RCLCPP_INFO(this->get_logger(), "Vision node aktif. Subscribe: %s",
-                CAMERA_TOPIC.c_str());
+    RCLCPP_INFO(this->get_logger(), "Vision node aktif.");
+    RCLCPP_INFO(this->get_logger(), "  subscribe : %s", CAMERA_TOPIC.c_str());
+    RCLCPP_INFO(this->get_logger(), "  publish   : %s", TARGET_TOPIC.c_str());
     RCLCPP_INFO(this->get_logger(), "Menunggu gambar pertama...");
   }
 
@@ -56,15 +69,18 @@ private:
   void buildTuningWindow()
   {
     cv::namedWindow(WIN_TUNING, cv::WINDOW_NORMAL);
-    cv::resizeWindow(WIN_TUNING, 460, 340);
+    cv::resizeWindow(WIN_TUNING, 460, 400);
 
-    // Default diarahkan ke warna putih: saturasi rendah, value tinggi
+    // Nilai hasil tuning
     p_.h_min = 0;   p_.h_max = 179;
     p_.s_min = 0;   p_.s_max = 40;
     p_.v_min = 180; p_.v_max = 255;
 
     p_.top_w = 20;  p_.bot_w = 95;
     p_.top_y = 60;  p_.bot_y = 95;
+
+    p_.look_y = 50;   // pita di tengah gambar BEV
+    p_.band_h = 15;
 
     cv::createTrackbar("H min", WIN_TUNING, &p_.h_min, 179);
     cv::createTrackbar("H max", WIN_TUNING, &p_.h_max, 179);
@@ -77,6 +93,9 @@ private:
     cv::createTrackbar("BEV bawah lebar %", WIN_TUNING, &p_.bot_w, 100);
     cv::createTrackbar("BEV atas Y %",      WIN_TUNING, &p_.top_y, 100);
     cv::createTrackbar("BEV bawah Y %",     WIN_TUNING, &p_.bot_y, 100);
+
+    cv::createTrackbar("Lookahead Y %",     WIN_TUNING, &p_.look_y, 100);
+    cv::createTrackbar("Tebal pita %",      WIN_TUNING, &p_.band_h, 50);
   }
 
   cv::Mat threshold(const cv::Mat & frame)
@@ -108,10 +127,10 @@ private:
     float cx = w / 2.0f;
 
     return {
-      cv::Point2f(cx - (top_w * w / 2.0f), top_y),  // kiri atas
-      cv::Point2f(cx + (top_w * w / 2.0f), top_y),  // kanan atas
-      cv::Point2f(cx + (bot_w * w / 2.0f), bot_y),  // kanan bawah
-      cv::Point2f(cx - (bot_w * w / 2.0f), bot_y)   // kiri bawah
+      cv::Point2f(cx - (top_w * w / 2.0f), top_y),
+      cv::Point2f(cx + (top_w * w / 2.0f), top_y),
+      cv::Point2f(cx + (bot_w * w / 2.0f), bot_y),
+      cv::Point2f(cx - (bot_w * w / 2.0f), bot_y)
     };
   }
 
@@ -129,6 +148,40 @@ private:
     cv::Mat bev;
     cv::warpPerspective(img, bev, matrix, cv::Size(w, h));
     return bev;
+  }
+
+  // ----------------------------------------------------------------
+  // Step 5: cari titik belok dari gambar BEV
+  //
+  // Ambil satu pita horizontal pada jarak lookahead, lalu hitung titik
+  // berat (centroid) piksel putih di pita itu. Karena garis tengah
+  // berupa garis putus-putus, pita bisa kosong sesaat -- kalau begitu
+  // kita pakai target terakhir yang valid supaya mobil tidak menyentak.
+  // ----------------------------------------------------------------
+  bool findTurnTarget(const cv::Mat & bev, int & band_top, int & band_bot,
+                      double & target_x)
+  {
+    const int h = bev.rows;
+
+    int band_center = static_cast<int>(p_.look_y / 100.0 * h);
+    int half_band   = std::max(1, static_cast<int>(p_.band_h / 100.0 * h / 2));
+
+    band_top = std::max(0, band_center - half_band);
+    band_bot = std::min(h, band_center + half_band);
+
+    if (band_bot <= band_top) return false;
+
+    cv::Mat band = bev(cv::Range(band_top, band_bot), cv::Range::all());
+
+    // Momen orde nol = jumlah piksel putih, orde satu = jumlah posisi x
+    cv::Moments m = cv::moments(band, true);
+
+    if (m.m00 < 50) {       // terlalu sedikit piksel, anggap tidak ketemu
+      return false;
+    }
+
+    target_x = m.m10 / m.m00;
+    return true;
   }
 
   void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -157,7 +210,54 @@ private:
     std::vector<cv::Point2f> src = getBevPoints(w, h);
     cv::Mat bev = warpBev(mask, src, w, h);
 
-    // Gambar trapesium di frame asli supaya kelihatan area mana yang diambil
+    // --- Cari titik belok ---
+    int band_top = 0, band_bot = 0;
+    double target_x = 0.0;
+    bool found = findTurnTarget(bev, band_top, band_bot, target_x);
+
+    bool valid = found;
+    if (found) {
+      last_target_x_   = target_x;
+      has_last_target_ = true;
+    } else if (has_last_target_) {
+      target_x = last_target_x_;   // pakai nilai terakhir saat garis putus
+    } else {
+      target_x = w / 2.0;          // belum pernah ketemu: anggap lurus
+    }
+
+    int band_center_y = (band_top + band_bot) / 2;
+
+    auto point = geometry_msgs::msg::Point();
+    point.x = target_x;
+    point.y = static_cast<double>(band_center_y);
+    point.z = valid ? 1.0 : 0.0;
+    pub_->publish(point);
+
+    // --- Tampilan ---
+    cv::Mat bev_color;
+    cv::cvtColor(bev, bev_color, cv::COLOR_GRAY2BGR);
+
+    // Pita pencarian (kuning)
+    cv::rectangle(bev_color, cv::Point(0, band_top), cv::Point(w, band_bot),
+                  cv::Scalar(0, 255, 255), 2);
+
+    // Garis tengah gambar = arah lurus (biru)
+    cv::line(bev_color, cv::Point(w / 2, 0), cv::Point(w / 2, h),
+             cv::Scalar(255, 0, 0), 1);
+
+    // Titik target (hijau kalau valid, merah kalau pakai nilai terakhir)
+    cv::Scalar color = valid ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
+    cv::circle(bev_color, cv::Point(static_cast<int>(target_x), band_center_y),
+               10, color, -1);
+    cv::line(bev_color, cv::Point(w / 2, h),
+             cv::Point(static_cast<int>(target_x), band_center_y), color, 2);
+
+    double offset = target_x - w / 2.0;
+    cv::putText(bev_color,
+                cv::format("offset: %+.1f px", offset),
+                cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                cv::Scalar(255, 255, 255), 2);
+
     cv::Mat preview = frame.clone();
     std::vector<cv::Point> poly;
     for (const auto & pt : src) {
@@ -167,24 +267,30 @@ private:
 
     cv::imshow(WIN_RAW, preview);
     cv::imshow(WIN_THRESH, mask);
-    cv::imshow(WIN_BEV, bev);
+    cv::imshow(WIN_BEV, bev_color);
 
     int key = cv::waitKey(1) & 0xFF;
     if (key == 's') {
       RCLCPP_INFO(this->get_logger(),
-                  "HSV: [%d,%d,%d] - [%d,%d,%d] | BEV: atas_w=%d bawah_w=%d "
-                  "atas_y=%d bawah_y=%d",
+                  "HSV [%d,%d,%d]-[%d,%d,%d] | BEV %d/%d/%d/%d | "
+                  "look_y=%d band_h=%d",
                   p_.h_min, p_.s_min, p_.v_min,
                   p_.h_max, p_.s_max, p_.v_max,
-                  p_.top_w, p_.bot_w, p_.top_y, p_.bot_y);
+                  p_.top_w, p_.bot_w, p_.top_y, p_.bot_y,
+                  p_.look_y, p_.band_h);
     } else if (key == 'q') {
       rclcpp::shutdown();
     }
   }
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_;
+  rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr pub_;
+
   TuningParams p_;
   unsigned long frame_count_;
+
+  double last_target_x_;
+  bool   has_last_target_;
 };
 
 int main(int argc, char ** argv)
