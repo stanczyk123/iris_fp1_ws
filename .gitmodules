@@ -1,3 +1,3 @@
 [submodule "simulation"]
-	path = simulation
+	path = src/simulation
 	url = https://github.com/Internship-IRIS-ITS/fira_simulation_ros2_docker

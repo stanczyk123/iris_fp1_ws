@@ -1,12 +1,13 @@
 #!/bin/bash
 
 PACKAGES=(master vision communication)
+SRC_DIR=src
 
 usage() {
     cat <<EOF
 Usage: $0 [-f|--force] [-h|--help]
 
-Create the ROS 2 packages: ${PACKAGES[*]}
+Create the ROS 2 packages in $SRC_DIR/: ${PACKAGES[*]}
 
 Options:
   -f, --force   Remove existing packages and create them again
@@ -36,23 +37,27 @@ esac
 
 if [[ $FORCE -eq 1 ]]; then
     for pkg in "${PACKAGES[@]}"; do
-        rm -rf "$pkg"
+        rm -rf "${SRC_DIR:?}/$pkg"
     done
 else
     for pkg in "${PACKAGES[@]}"; do
-        if [[ -d "$pkg" ]]; then
-            echo "Package '$pkg' already exists. Use -f/--force to reset packages." >&2
+        if [[ -d "$SRC_DIR/$pkg" ]]; then
+            echo "Package '$SRC_DIR/$pkg' already exists. Use -f/--force to reset packages." >&2
             exit 1
         fi
     done
 fi
 
+mkdir -p "$SRC_DIR"
 for pkg in "${PACKAGES[@]}"; do
-    ros2 pkg create --build-type ament_cmake --license Apache-2.0 "$pkg"
+    ros2 pkg create --build-type ament_cmake --license Apache-2.0 \
+        --destination-directory "$SRC_DIR" "$pkg"
 done
 
-git add -A -- "${PACKAGES[@]}"
-if git diff --cached --quiet -- "${PACKAGES[@]}"; then
+PKG_PATHS=("${PACKAGES[@]/#/$SRC_DIR/}")
+
+git add -A -- "${PKG_PATHS[@]}"
+if git diff --cached --quiet -- "${PKG_PATHS[@]}"; then
     echo "Nothing to commit."
 else
     git commit -m "feat: initialize workspace & packages"
