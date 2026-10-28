@@ -32,7 +32,10 @@ ament_target_dependencies(udp_sender_node rclcpp geometry_msgs)
 add_executable(udp_receiver_node src/udp_receiver_node.cpp)
 ament_target_dependencies(udp_receiver_node rclcpp std_msgs)
 
-install(TARGETS udp_sender_node udp_receiver_node
+add_executable(keyboard_teleop_node src/keyboard_teleop_node.cpp)
+ament_target_dependencies(keyboard_teleop_node rclcpp geometry_msgs)
+
+install(TARGETS udp_sender_node udp_receiver_node keyboard_teleop_node
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
