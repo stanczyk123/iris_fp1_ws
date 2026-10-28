@@ -1,19 +1,19 @@
 // IRIS FP1 - Master Node
-// Objektif 3: Motion-to-point        (mode: point)
-// Objektif 6: Full Autonomous Car    (mode: follow)
+// Objektif 3: Motion-to-point            (mode: point)
+// Objektif 6: Full Autonomous Car        (mode: follow)
+// Objektif opsional: Obstacle Avoidance  (lapisan pengaman, kedua mode)
 //
 // Odometry dari vel_x/vel_y yang dikirim simulasi:
 //   heading = atan2(vel_y, vel_x)
 //   x += vel_x * dt,  y += vel_y * dt
 //
-// mode "point"  : jalan ke koordinat target, lalu berhenti.
-// mode "follow" : ikuti titik belok dari /turn_target (package vision).
+// Lapisan pengaman halangan diterapkan di fungsi kirim(), yaitu satu-satunya
+// jalan keluar perintah. Dengan begitu mode point maupun follow sama-sama
+// terlindungi tanpa logika ganda, dan tidak ada jalur yang bisa melewatinya.
 //
 // Catatan tanda steering: pada simulasi ini steering POSITIF = belok KANAN.
-//   - Di mode point, error sudut positif berarti target di KIRI,
-//     jadi tandanya dibalik.
-//   - Di mode follow, offset piksel positif berarti target di KANAN,
-//     jadi tandanya tidak dibalik.
+//   - Mode point : error sudut positif berarti target di KIRI, jadi dibalik.
+//   - Mode follow: offset piksel positif berarti target di KANAN, tidak dibalik.
 //
 // Contoh:
 //   ros2 run master master_node --ros-args -p mode:=point -p target_x:=10.0
@@ -27,6 +27,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <geometry_msgs/msg/pose2_d.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -60,12 +61,16 @@ public:
     jarak_pelan_    = this->declare_parameter<double>("jarak_pelan", 2.0);
 
     // --- Mode follow ---
-    // Lebar gambar BEV dari vision_node (kamera simulasi 800x800).
-    lebar_gambar_  = this->declare_parameter<int>("lebar_gambar", 800);
-    // Berapa derajat steering saat target berada di tepi gambar.
-    follow_gain_   = this->declare_parameter<double>("follow_gain", 45.0);
-    // Mobil berhenti kalau tidak ada titik belok selama sekian milidetik.
+    lebar_gambar_      = this->declare_parameter<int>("lebar_gambar", 800);
+    follow_gain_       = this->declare_parameter<double>("follow_gain", 45.0);
     target_timeout_ms_ = this->declare_parameter<int>("target_timeout_ms", 1000);
+
+    // --- Pengaman halangan ---
+    // Ambang berhenti harus jauh di atas range_min LiDAR (1.5 m), karena
+    // halangan yang lebih dekat dari itu tidak terbaca sama sekali.
+    obstacle_stop_       = this->declare_parameter<double>("obstacle_stop", 5.0);
+    obstacle_slow_       = this->declare_parameter<double>("obstacle_slow", 10.0);
+    obstacle_timeout_ms_ = this->declare_parameter<int>("obstacle_timeout_ms", 1000);
 
     // --- Umum ---
     pwm_jalan_     = this->declare_parameter<int>("pwm_jalan", 90);
@@ -80,6 +85,10 @@ public:
       "/turn_target", 10,
       std::bind(&MasterNode::turnTargetCallback, this, std::placeholders::_1));
 
+    sub_obstacle_ = this->create_subscription<std_msgs::msg::Float32>(
+      "/obstacle_distance", 10,
+      std::bind(&MasterNode::obstacleCallback, this, std::placeholders::_1));
+
     odom_pub_ = this->create_publisher<geometry_msgs::msg::Pose2D>("/odom_2d", 10);
     cmd_pub_  = this->create_publisher<geometry_msgs::msg::Twist>("/velocity_command", 10);
 
@@ -92,7 +101,6 @@ public:
     if (mode_ == "follow") {
       RCLCPP_INFO(this->get_logger(), "Master node aktif (mode: FOLLOW).");
       RCLCPP_INFO(this->get_logger(), "  mengikuti /turn_target dari vision");
-      RCLCPP_INFO(this->get_logger(), "  pastikan vision_node juga berjalan!");
     } else {
       RCLCPP_INFO(this->get_logger(), "Master node aktif (mode: POINT).");
       if (target_relatif_) {
@@ -103,6 +111,9 @@ public:
                     target_x_, target_y_);
       }
     }
+    RCLCPP_INFO(this->get_logger(),
+                "  pengaman: melambat di %.1f m, berhenti di %.1f m",
+                obstacle_slow_, obstacle_stop_);
     RCLCPP_INFO(this->get_logger(), "Menunggu data encoder...");
   }
 
@@ -156,15 +167,19 @@ private:
     odom_pub_->publish(pose);
   }
 
-  // ----------------------------------------------------------------
-  // Titik belok dari package vision
-  // ----------------------------------------------------------------
   void turnTargetCallback(const geometry_msgs::msg::Point::SharedPtr msg)
   {
     turn_target_x_ = msg->x;
     turn_valid_    = (msg->z > 0.5);
     last_target_time_ = this->now();
     ada_target_ = true;
+  }
+
+  void obstacleCallback(const std_msgs::msg::Float32::SharedPtr msg)
+  {
+    obstacle_dist_ = msg->data;
+    last_obstacle_time_ = this->now();
+    ada_obstacle_ = true;
   }
 
   // ----------------------------------------------------------------
@@ -181,11 +196,8 @@ private:
     }
   }
 
-  // --- Objektif 6: ikuti garis ---
   void controlFollow()
   {
-    // Kehilangan kontak dengan vision = berhenti, lebih aman daripada
-    // melaju memakai perintah lama.
     double umur_ms = ada_target_
       ? (this->now() - last_target_time_).nanoseconds() / 1.0e6
       : 1.0e9;
@@ -197,26 +209,20 @@ private:
       return;
     }
 
-    // Offset piksel dari tengah gambar, dinormalisasi ke -1..1
     double tengah = lebar_gambar_ / 2.0;
     offset_ = turn_target_x_ - tengah;
     double norm = std::clamp(offset_ / tengah, -1.0, 1.0);
 
-    // Offset positif = target di kanan = steering positif (belok kanan)
     double steering = std::clamp(norm * follow_gain_, -90.0, 90.0);
 
-    // Pelan saat menikung tajam supaya tidak melebar keluar lajur
     int pwm = static_cast<int>(pwm_jalan_ * (1.0 - 0.6 * std::fabs(norm)));
     pwm = std::clamp(std::max(pwm, pwm_min_), -255, 255);
 
     kirim(pwm, static_cast<int>(steering));
   }
 
-  // --- Objektif 3: menuju koordinat ---
   void controlPoint()
   {
-    // Mobil yang diam tidak punya arah hadap yang terbaca dari kecepatan.
-    // Maju lurus sebentar dulu, baru target relatif diterjemahkan ke dunia.
     if (target_relatif_ && !target_siap_) {
       double speed = std::hypot(static_cast<double>(vel_x_),
                                 static_cast<double>(vel_y_));
@@ -255,7 +261,6 @@ private:
 
     error_ = normalize(std::atan2(dy, dx) - theta_);
 
-    // Tanda dibalik: error positif = target di kiri, steering positif = kanan
     double steering = std::clamp(-error_ * steering_gain_, -90.0, 90.0);
 
     int pwm = pwm_jalan_;
@@ -272,8 +277,35 @@ private:
     kirim(pwm, static_cast<int>(steering));
   }
 
+  // ----------------------------------------------------------------
+  // Satu-satunya jalan keluar perintah, sekaligus lapisan pengaman
+  // ----------------------------------------------------------------
   void kirim(int pwm, int steering)
   {
+    rem_aktif_ = false;
+
+    // Pengaman hanya berlaku saat maju. Mundur dibiarkan supaya mobil
+    // masih bisa lepas kalau terlanjur mepet halangan.
+    if (ada_obstacle_ && pwm > 0) {
+      double umur_ms = (this->now() - last_obstacle_time_).nanoseconds() / 1.0e6;
+
+      // Data LiDAR basi diabaikan, supaya mobil tidak ikut mati kalau
+      // node lidar dimatikan di tengah jalan.
+      if (umur_ms < obstacle_timeout_ms_) {
+        if (obstacle_dist_ < obstacle_stop_) {
+          pwm = 0;
+          rem_aktif_ = true;
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                               "HALANGAN %.2f m - berhenti.", obstacle_dist_);
+        } else if (obstacle_dist_ < obstacle_slow_) {
+          double f = (obstacle_dist_ - obstacle_stop_) /
+                     (obstacle_slow_ - obstacle_stop_);
+          pwm = static_cast<int>(pwm * f);
+          rem_aktif_ = true;
+        }
+      }
+    }
+
     auto cmd = geometry_msgs::msg::Twist();
     cmd.linear.x  = static_cast<double>(pwm);
     cmd.angular.z = static_cast<double>(steering);
@@ -287,28 +319,36 @@ private:
   {
     if (first_packet_) return;
 
+    char info_halangan[64];
+    if (!ada_obstacle_) {
+      std::snprintf(info_halangan, sizeof(info_halangan), " | lidar: -");
+    } else {
+      std::snprintf(info_halangan, sizeof(info_halangan), " | lidar: %.1f m%s",
+                    obstacle_dist_, rem_aktif_ ? "  [REM]" : "");
+    }
+
     if (mode_ == "follow") {
       RCLCPP_INFO(this->get_logger(),
                   "FOLLOW | pos=(%.1f, %.1f) hdg=%.0f | offset=%+.0f px %s | "
-                  "pwm=%d steer=%d",
+                  "pwm=%d steer=%d%s",
                   x_, y_, theta_ * 180.0 / M_PI,
                   offset_, turn_valid_ ? "[lihat]" : "[tebak]",
-                  last_pwm_, last_steering_);
+                  last_pwm_, last_steering_, info_halangan);
     } else {
       double tx = target_relatif_ ? world_target_x_ : target_x_;
       double ty = target_relatif_ ? world_target_y_ : target_y_;
       RCLCPP_INFO(this->get_logger(),
                   "POINT | pos=(%.2f, %.2f) hdg=%.0f | target=(%.1f, %.1f) "
-                  "jarak=%.2f m err=%.0f deg | pwm=%d steer=%d%s",
+                  "jarak=%.2f m | pwm=%d steer=%d%s%s",
                   x_, y_, theta_ * 180.0 / M_PI, tx, ty,
-                  jarak_, error_ * 180.0 / M_PI,
-                  last_pwm_, last_steering_,
-                  sampai_ ? "  [SAMPAI]" : "");
+                  jarak_, last_pwm_, last_steering_,
+                  sampai_ ? "  [SAMPAI]" : "", info_halangan);
     }
   }
 
   rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr sub_feedback_;
   rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr sub_target_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_obstacle_;
   rclcpp::Publisher<geometry_msgs::msg::Pose2D>::SharedPtr odom_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::TimerBase::SharedPtr control_timer_;
@@ -330,6 +370,13 @@ private:
   bool   ada_target_ = false;
   rclcpp::Time last_target_time_;
   double offset_ = 0.0;
+
+  double obstacle_stop_, obstacle_slow_;
+  int    obstacle_timeout_ms_;
+  double obstacle_dist_ = 0.0;
+  bool   ada_obstacle_ = false;
+  bool   rem_aktif_ = false;
+  rclcpp::Time last_obstacle_time_;
 
   int pwm_jalan_, pwm_min_;
 

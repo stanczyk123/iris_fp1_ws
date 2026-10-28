@@ -29,9 +29,16 @@ find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
+find_package(std_msgs REQUIRED)
+
+add_executable(lidar_node src/lidar_node.cpp)
+ament_target_dependencies(lidar_node rclcpp sensor_msgs std_msgs)
+
 add_executable(vision_node src/vision_node.cpp)
 ament_target_dependencies(vision_node rclcpp sensor_msgs geometry_msgs cv_bridge OpenCV)
-install(TARGETS vision_node
+
+
+install(TARGETS vision_node lidar_node
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
