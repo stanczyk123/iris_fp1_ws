@@ -2,23 +2,27 @@
 // Step 4: Image Thresholding & Bird-Eye View (BEV)
 // Step 5: Finding Turn Target  (deteksi dua garis lajur)
 //
-// Alur: kamera -> threshold HSV -> warp BEV -> cari garis kiri & kanan
+// Alur: kamera -> threshold HSV -> warp BEV -> cari garis lajur
 //       -> titik tengah lajur -> /turn_target
 //
-// PERUBAHAN DARI VERSI SEBELUMNYA
-// Versi lama mengambil titik berat SELURUH piksel putih di pita pencarian.
-// Cara itu gagal di tikungan: garis solid tepi jalan punya jauh lebih banyak
-// piksel daripada garis putus-putus pembatas tengah, sehingga titik beratnya
-// tertarik ke garis solid dan mobil keluar dari lajurnya.
+// CATATAN PERUBAHAN
 //
-// Versi ini mencari garis KIRI dan KANAN secara terpisah, lalu mengambil
-// titik tengah di antara keduanya. Kalau hanya satu garis yang terlihat,
-// posisi lajur diperkirakan dari garis itu ditambah setengah lebar lajur.
+// v1 mengambil titik berat SELURUH piksel putih di pita pencarian. Gagal di
+// tikungan karena garis solid punya jauh lebih banyak piksel daripada garis
+// putus-putus, sehingga titik beratnya tertarik ke garis solid.
 //
-// Tiap garis juga diklasifikasikan PUTUS-PUTUS atau SOLID, dihitung dari
-// rasio keterisian kolomnya sepanjang gambar BEV. Garis solid terisi hampir
-// penuh; garis putus-putus tidak. Informasi ini dipakai saat hanya satu
-// garis terlihat, untuk menentukan ke arah mana lajur berada.
+// v2 membagi gambar menjadi setengah kiri dan setengah kanan. Masih gagal di
+// tikungan tajam, karena di sana KEDUA garis bisa berada di sisi yang sama
+// dari tengah gambar, sehingga salah satu sisi tidak menemukan apa pun.
+//
+// v3 (versi ini) mencari SEMUA garis di seluruh lebar gambar, lalu memilih
+// pasangan yang jaraknya paling mendekati lebar lajur. Bila hanya satu garis
+// yang terlihat, sisi kiri/kanannya ditentukan dari kesinambungan dengan
+// target sebelumnya, bukan dari posisi tengah gambar.
+//
+// Klasifikasi PUTUS-PUTUS vs SOLID dihitung dengan jendela geser yang
+// MENGIKUTI lengkungan garis. Versi sebelumnya memakai kolom tegak lurus,
+// sehingga garis solid yang miring salah terbaca sebagai putus-putus.
 //
 // Hasil dipublish ke /turn_target (geometry_msgs/Point):
 //   x = posisi target (piksel, 0..lebar BEV)
@@ -62,14 +66,13 @@ struct TuningParams
   int band_h;        // tebal pita, % dari tinggi BEV
   int lebar_lajur;   // setengah lebar lajur, % dari lebar BEV
   int min_piksel;    // piksel minimum agar sebuah garis dianggap ada
+  int zoom_out;      // margin hasil warp, % dari lebar BEV
 };
 
-// Hasil deteksi satu sisi garis
 struct Garis
 {
-  bool   ada   = false;
-  double x     = 0.0;
-  double isi   = 0.0;   // rasio keterisian kolom, 0..1
+  double x    = 0.0;
+  double isi  = 0.0;    // rasio keterisian, 0..1
   bool   solid = false;
 };
 
@@ -101,21 +104,30 @@ private:
     cv::namedWindow(WIN_TUNING, cv::WINDOW_NORMAL);
     cv::resizeWindow(WIN_TUNING, 460, 460);
 
-    // Nilai hasil kalibrasi
     p_.h_min = 0;   p_.h_max = 179;
     p_.s_min = 0;   p_.s_max = 40;
     p_.v_min = 180; p_.v_max = 255;
 
-    p_.top_w = 20;  p_.bot_w = 95;
-    p_.top_y = 60;  p_.bot_y = 95;
+    p_.top_w = 60;  p_.bot_w = 100;
+    // Sisi bawah dinaikkan agar wadah sensor di kap mobil, yang berwarna
+    // putih dan selalu ada di frame, tidak ikut ter-warp ke BEV.
+    p_.top_y = 70;  p_.bot_y = 83;
 
-    p_.look_y = 50;
-    p_.band_h = 15;
+    // Trapesium dipetakan ke daerah yang lebih sempit dari gambar keluaran,
+    // sehingga area di LUAR trapesium ikut terlihat. Tanpa ini, lajur nyaris
+    // selebar frame dan salah satu garis selalu mepet tepi — terpotong,
+    // lalu salah diklasifikasi sebagai putus-putus.
+    p_.zoom_out = 20;
 
-    // Setengah lebar lajur dalam BEV. Perlu dituning sekali: jalankan di
-    // jalan lurus saat kedua garis terlihat, lihat nilai "setengah lebar"
-    // yang tercetak, lalu set slider ini ke angka itu.
-    p_.lebar_lajur = 25;
+    // Lookahead lebih dekat ke mobil (nilai lebih besar = lebih dekat).
+    // Di tikungan tajam, titik yang terlalu jauh ke depan sudah keluar
+    // dari lajur sebelum mobil sampai ke sana.
+    p_.look_y = 62;
+    // Pita harus cukup tinggi untuk memotong setidaknya satu segmen garis
+    // putus-putus. Pita tipis sering jatuh tepat di jeda antar segmen.
+    p_.band_h = 30;
+
+    p_.lebar_lajur = 24;
     p_.min_piksel  = 60;
 
     cv::createTrackbar("H min", WIN_TUNING, &p_.h_min, 179);
@@ -134,6 +146,7 @@ private:
     cv::createTrackbar("Tebal pita %",      WIN_TUNING, &p_.band_h, 50);
     cv::createTrackbar("1/2 lebar lajur %", WIN_TUNING, &p_.lebar_lajur, 60);
     cv::createTrackbar("Min piksel",        WIN_TUNING, &p_.min_piksel, 400);
+    cv::createTrackbar("Zoom out %",        WIN_TUNING, &p_.zoom_out, 40);
   }
 
   cv::Mat threshold(const cv::Mat & frame)
@@ -175,11 +188,18 @@ private:
   cv::Mat warpBev(const cv::Mat & img, const std::vector<cv::Point2f> & src,
                   int w, int h)
   {
+    // Margin membuat trapesium dipetakan ke daerah yang lebih sempit.
+    // warpPerspective tetap mengisi seluruh gambar keluaran memakai
+    // homografi yang sama, jadi daerah di luar margin menampilkan area di
+    // LUAR trapesium. Efeknya seperti memundurkan kamera: lajur jadi lebih
+    // ramping di frame dan kedua garis punya ruang dari tepi.
+    float m = p_.zoom_out / 100.0f * w;
+
     std::vector<cv::Point2f> dst = {
-      cv::Point2f(0, 0),
-      cv::Point2f(static_cast<float>(w), 0),
-      cv::Point2f(static_cast<float>(w), static_cast<float>(h)),
-      cv::Point2f(0, static_cast<float>(h))
+      cv::Point2f(m, 0),
+      cv::Point2f(w - m, 0),
+      cv::Point2f(w - m, static_cast<float>(h)),
+      cv::Point2f(m, static_cast<float>(h))
     };
 
     cv::Mat matrix = cv::getPerspectiveTransform(src, dst);
@@ -189,83 +209,139 @@ private:
   }
 
   // ----------------------------------------------------------------
-  // Cari satu garis di dalam rentang kolom [x_awal, x_akhir)
+  // Keterisian garis, diukur dengan jendela geser yang MENGIKUTI garis.
   //
-  // Dua tahap supaya tahan terhadap noise sekaligus halus:
-  //   1. cari kolom dengan piksel putih terbanyak (puncak histogram)
-  //   2. hitung titik berat di sekitar puncak itu saja
+  // Mulai dari posisi garis di pita, lalu merambat ke atas dan ke bawah.
+  // Tiap langkah, jendela digeser ke titik berat piksel putih yang ditemukan,
+  // sehingga lengkungan garis tetap terikuti. Rasio = langkah yang menemukan
+  // piksel dibagi total langkah.
   //
-  // Memakai titik berat seluruh rentang akan tertarik oleh noise di tepi;
-  // memakai puncak saja menghasilkan posisi yang meloncat-loncat.
+  //   garis solid       -> mendekati 1.0
+  //   garis putus-putus -> sekitar 0.4 - 0.7
+  //
+  // Kolom tegak lurus (versi sebelumnya) salah membaca garis solid yang
+  // miring sebagai putus-putus, karena garisnya keluar dari kolom.
   // ----------------------------------------------------------------
-  Garis cariGaris(const cv::Mat & bev, const cv::Mat & band,
-                  int x_awal, int x_akhir)
+  double keterisian(const cv::Mat & bev, double x_awal, int y_awal)
   {
-    Garis g;
     const int w = bev.cols;
     const int h = bev.rows;
+    const int langkah = std::max(4, h / 40);
+    const int jendela = std::max(6, w / 25);
 
-    x_awal  = std::clamp(x_awal, 0, w);
-    x_akhir = std::clamp(x_akhir, 0, w);
-    if (x_akhir - x_awal < 3) return g;
+    int total = 0, kena = 0;
 
-    // --- Tahap 1: histogram kolom ---
-    std::vector<int> hist(x_akhir - x_awal, 0);
-    for (int y = 0; y < band.rows; ++y) {
-      const uint8_t * baris = band.ptr<uint8_t>(y);
-      for (int x = x_awal; x < x_akhir; ++x) {
-        if (baris[x] > 0) hist[x - x_awal]++;
+    for (int arah = -1; arah <= 1; arah += 2) {
+      double x = x_awal;
+      for (int y = y_awal; y >= 0 && y < h; y += arah * langkah) {
+        // Jangan menghitung langkah yang jendelanya menyentuh tepi gambar.
+        // Garis yang terpotong frame akan terlihat "bolong" dan salah
+        // diklasifikasi sebagai putus-putus padahal dia menerus.
+        if (x < jendela || x > w - jendela) continue;
+
+        total++;
+
+        int xlo = std::clamp(static_cast<int>(x) - jendela, 0, w);
+        int xhi = std::clamp(static_cast<int>(x) + jendela, 0, w);
+        int ylo = std::max(0, y - langkah / 2);
+        int yhi = std::min(h, y + langkah / 2 + 1);
+
+        int cacah = 0;
+        double jumlah = 0.0;
+        for (int yy = ylo; yy < yhi; ++yy) {
+          const uint8_t * baris = bev.ptr<uint8_t>(yy);
+          for (int xx = xlo; xx < xhi; ++xx) {
+            if (baris[xx] > 0) { cacah++; jumlah += xx; }
+          }
+        }
+
+        if (cacah > 0) {
+          kena++;
+          x = jumlah / cacah;   // ikuti lengkungan
+        }
       }
     }
 
-    int puncak_i = 0, puncak_v = 0, total = 0;
-    for (size_t i = 0; i < hist.size(); ++i) {
-      total += hist[i];
-      if (hist[i] > puncak_v) { puncak_v = hist[i]; puncak_i = static_cast<int>(i); }
-    }
-
-    if (total < p_.min_piksel || puncak_v == 0) return g;
-
-    // --- Tahap 2: titik berat di sekitar puncak ---
-    const int jendela = std::max(5, w / 20);
-    int lo = std::max(0, puncak_i - jendela);
-    int hi = std::min(static_cast<int>(hist.size()), puncak_i + jendela + 1);
-
-    double jumlah = 0.0, berbobot = 0.0;
-    for (int i = lo; i < hi; ++i) {
-      jumlah   += hist[i];
-      berbobot += hist[i] * static_cast<double>(i + x_awal);
-    }
-    if (jumlah < 1.0) return g;
-
-    g.ada = true;
-    g.x   = berbobot / jumlah;
-
-    // --- Klasifikasi putus-putus vs solid ---
-    // Hitung keterisian kolom di sekitar garis, sepanjang SELURUH tinggi BEV.
-    // Garis solid terisi hampir penuh, garis putus-putus hanya sebagian.
-    int cx  = static_cast<int>(g.x);
-    int clo = std::clamp(cx - jendela, 0, w);
-    int chi = std::clamp(cx + jendela, 0, w);
-
-    int terisi = 0;
-    for (int y = 0; y < h; ++y) {
-      const uint8_t * baris = bev.ptr<uint8_t>(y);
-      for (int x = clo; x < chi; ++x) {
-        if (baris[x] > 0) { terisi++; break; }   // cukup satu per baris
-      }
-    }
-    g.isi   = static_cast<double>(terisi) / std::max(1, h);
-    g.solid = (g.isi > 0.75);
-
-    return g;
+    return total > 0 ? static_cast<double>(kena) / total : 0.0;
   }
 
   // ----------------------------------------------------------------
-  // Step 5: tentukan titik tengah lajur
+  // Cari SEMUA garis di seluruh lebar pita, bukan per setengah gambar.
+  //
+  // Di tikungan tajam kedua garis bisa berada di sisi yang sama dari
+  // tengah gambar, sehingga pembagian kiri/kanan gagal total.
+  // ----------------------------------------------------------------
+  std::vector<Garis> cariSemuaGaris(const cv::Mat & bev, const cv::Mat & band,
+                                    int band_center_y)
+  {
+    const int w = bev.cols;
+    std::vector<Garis> hasil;
+
+    // Histogram kolom
+    std::vector<int> hist(w, 0);
+    for (int y = 0; y < band.rows; ++y) {
+      const uint8_t * baris = band.ptr<uint8_t>(y);
+      for (int x = 0; x < w; ++x) {
+        if (baris[x] > 0) hist[x]++;
+      }
+    }
+
+    // Haluskan agar satu garis tidak terpecah jadi beberapa puncak
+    const int k = std::max(3, w / 60);
+    std::vector<int> halus(w, 0);
+    for (int x = 0; x < w; ++x) {
+      int jumlah = 0, n = 0;
+      for (int i = -k; i <= k; ++i) {
+        int xx = x + i;
+        if (xx >= 0 && xx < w) { jumlah += hist[xx]; n++; }
+      }
+      halus[x] = n > 0 ? jumlah / n : 0;
+    }
+
+    // Ambil puncak tertinggi berulang kali, tiap kali menutup daerah di
+    // sekitarnya supaya satu garis tidak terhitung dua kali.
+    const int jarak_min = std::max(10, w / 12);
+    std::vector<bool> dipakai(w, false);
+
+    while (hasil.size() < 4) {
+      int puncak = -1, nilai = 0;
+      for (int x = 0; x < w; ++x) {
+        if (!dipakai[x] && halus[x] > nilai) { nilai = halus[x]; puncak = x; }
+      }
+      if (puncak < 0 || nilai == 0) break;
+
+      int lo = std::max(0, puncak - jarak_min);
+      int hi = std::min(w, puncak + jarak_min + 1);
+
+      int total = 0;
+      double berbobot = 0.0;
+      for (int x = lo; x < hi; ++x) {
+        total    += hist[x];
+        berbobot += hist[x] * static_cast<double>(x);
+      }
+
+      for (int x = lo; x < hi; ++x) dipakai[x] = true;
+
+      if (total < p_.min_piksel) break;   // puncak berikutnya pasti lebih kecil
+
+      Garis g;
+      g.x     = berbobot / total;
+      g.isi   = keterisian(bev, g.x, band_center_y);
+      g.solid = (g.isi > 0.80);
+      hasil.push_back(g);
+    }
+
+    std::sort(hasil.begin(), hasil.end(),
+              [](const Garis & a, const Garis & b) { return a.x < b.x; });
+    return hasil;
+  }
+
+  // ----------------------------------------------------------------
+  // Tentukan titik tengah lajur dari garis-garis yang ditemukan
   // ----------------------------------------------------------------
   bool cariTargetLajur(const cv::Mat & bev, int & band_top, int & band_bot,
-                       double & target_x, Garis & kiri, Garis & kanan)
+                       double & target_x, std::vector<Garis> & garis,
+                       int & idx_kiri, int & idx_kanan)
   {
     const int w = bev.cols;
     const int h = bev.rows;
@@ -279,31 +355,65 @@ private:
 
     cv::Mat band = bev(cv::Range(band_top, band_bot), cv::Range::all());
 
-    const int tengah = w / 2;
-    kiri  = cariGaris(bev, band, 0, tengah);
-    kanan = cariGaris(bev, band, tengah, w);
+    garis = cariSemuaGaris(bev, band, (band_top + band_bot) / 2);
+    idx_kiri = idx_kanan = -1;
 
-    double setengah_lajur = p_.lebar_lajur / 100.0 * w;
+    if (garis.empty()) return false;
 
-    if (kiri.ada && kanan.ada) {
-      // Kasus ideal: kedua garis terlihat, lajur ada persis di tengahnya
-      target_x = (kiri.x + kanan.x) / 2.0;
-      lebar_terukur_ = (kanan.x - kiri.x) / 2.0;
-      return true;
+    const double setengah = p_.lebar_lajur / 100.0 * w;
+    const double harap    = 2.0 * setengah;
+
+    // --- Dua garis atau lebih: pilih pasangan yang jaraknya paling
+    //     mendekati lebar lajur ---
+    if (garis.size() >= 2) {
+      double beda_terbaik = 1e9;
+      int bi = -1, bj = -1;
+
+      for (size_t i = 0; i + 1 < garis.size(); ++i) {
+        for (size_t j = i + 1; j < garis.size(); ++j) {
+          double jarak = garis[j].x - garis[i].x;
+          double beda  = std::fabs(jarak - harap);
+          if (beda < beda_terbaik) {
+            beda_terbaik = beda;
+            bi = static_cast<int>(i);
+            bj = static_cast<int>(j);
+          }
+        }
+      }
+
+      // Terima hanya kalau jaraknya masuk akal sebagai satu lajur
+      if (bi >= 0 && beda_terbaik < 0.45 * harap) {
+        idx_kiri  = bi;
+        idx_kanan = bj;
+        target_x  = (garis[bi].x + garis[bj].x) / 2.0;
+        lebar_terukur_ = (garis[bj].x - garis[bi].x) / 2.0;
+        return true;
+      }
     }
 
-    if (kiri.ada) {
-      // Hanya garis kiri. Lajur berada setengah lebar ke kanan dari situ.
-      target_x = kiri.x + setengah_lajur;
-      return true;
+    // --- Hanya satu garis yang bisa dipakai ---
+    // Pilih yang paling dekat dengan target sebelumnya, lalu tentukan
+    // sisinya dari kesinambungan itu. Memakai tengah gambar sebagai acuan
+    // justru salah di tikungan tajam.
+    double acuan = has_last_target_ ? last_target_x_ : w / 2.0;
+
+    int terdekat = 0;
+    double beda_terdekat = 1e9;
+    for (size_t i = 0; i < garis.size(); ++i) {
+      double beda = std::fabs(garis[i].x - acuan);
+      if (beda < beda_terdekat) { beda_terdekat = beda; terdekat = static_cast<int>(i); }
     }
 
-    if (kanan.ada) {
-      target_x = kanan.x - setengah_lajur;
-      return true;
+    if (garis[terdekat].x < acuan) {
+      idx_kiri = terdekat;
+      target_x = garis[terdekat].x + setengah;
+    } else {
+      idx_kanan = terdekat;
+      target_x = garis[terdekat].x - setengah;
     }
 
-    return false;   // tidak ada garis sama sekali
+    target_x = std::clamp(target_x, 0.0, static_cast<double>(w));
+    return true;
   }
 
   void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -334,11 +444,19 @@ private:
 
     int band_top = 0, band_bot = 0;
     double target_x = 0.0;
-    Garis kiri, kanan;
-    bool found = cariTargetLajur(bev, band_top, band_bot, target_x, kiri, kanan);
+    std::vector<Garis> garis;
+    int idx_kiri = -1, idx_kanan = -1;
+
+    bool found = cariTargetLajur(bev, band_top, band_bot, target_x,
+                                 garis, idx_kiri, idx_kanan);
 
     bool valid = found;
     if (found) {
+      // Haluskan sedikit supaya steering tidak menyentak saat jumlah
+      // garis yang terlihat berubah
+      if (has_last_target_) {
+        target_x = 0.6 * target_x + 0.4 * last_target_x_;
+      }
       last_target_x_   = target_x;
       has_last_target_ = true;
     } else if (has_last_target_) {
@@ -362,26 +480,31 @@ private:
     cv::rectangle(bev_color, cv::Point(0, band_top), cv::Point(w, band_bot),
                   cv::Scalar(0, 255, 255), 2);
 
-    // Garis tengah gambar = arah lurus mobil
     cv::line(bev_color, cv::Point(w / 2, 0), cv::Point(w / 2, h),
              cv::Scalar(255, 0, 0), 1);
 
-    // Garis kiri (biru) dan kanan (merah), dengan label jenisnya
-    if (kiri.ada) {
-      int x = static_cast<int>(kiri.x);
+    // Semua garis yang ditemukan. Yang terpakai sebagai batas lajur
+    // digambar tebal, yang lain tipis dan abu-abu.
+    for (size_t i = 0; i < garis.size(); ++i) {
+      int x = static_cast<int>(garis[i].x);
+      bool terpakai = (static_cast<int>(i) == idx_kiri ||
+                       static_cast<int>(i) == idx_kanan);
+
+      cv::Scalar warna = !terpakai            ? cv::Scalar(120, 120, 120)
+                       : (static_cast<int>(i) == idx_kiri)
+                                              ? cv::Scalar(255, 128, 0)
+                                              : cv::Scalar(0, 128, 255);
+
       cv::line(bev_color, cv::Point(x, band_top), cv::Point(x, band_bot),
-               cv::Scalar(255, 128, 0), 3);
-      cv::putText(bev_color, kiri.solid ? "SOLID" : "PUTUS",
-                  cv::Point(std::max(2, x - 35), band_top - 8),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 128, 0), 1);
-    }
-    if (kanan.ada) {
-      int x = static_cast<int>(kanan.x);
-      cv::line(bev_color, cv::Point(x, band_top), cv::Point(x, band_bot),
-               cv::Scalar(0, 128, 255), 3);
-      cv::putText(bev_color, kanan.solid ? "SOLID" : "PUTUS",
-                  cv::Point(std::min(w - 70, x - 35), band_top - 8),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 128, 255), 1);
+               warna, terpakai ? 3 : 1);
+
+      if (terpakai) {
+        cv::putText(bev_color,
+                    cv::format("%s %.0f%%", garis[i].solid ? "SOLID" : "PUTUS",
+                               garis[i].isi * 100.0),
+                    cv::Point(std::clamp(x - 40, 2, w - 90), band_top - 8),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45, warna, 1);
+      }
     }
 
     cv::Scalar warna = valid ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
@@ -395,11 +518,14 @@ private:
                 cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7,
                 cv::Scalar(255, 255, 255), 2);
 
-    const char * sumber = (kiri.ada && kanan.ada) ? "2 garis"
-                        : kiri.ada                ? "kiri saja"
-                        : kanan.ada               ? "kanan saja"
-                                                  : "tidak ada";
-    cv::putText(bev_color, cv::format("sumber: %s", sumber),
+    const char * sumber =
+        (idx_kiri >= 0 && idx_kanan >= 0) ? "2 garis"
+      : (idx_kiri >= 0)                   ? "kiri saja"
+      : (idx_kanan >= 0)                  ? "kanan saja"
+                                          : "tidak ada";
+
+    cv::putText(bev_color,
+                cv::format("sumber: %s  (%zu kandidat)", sumber, garis.size()),
                 cv::Point(10, 58), cv::FONT_HERSHEY_SIMPLEX, 0.6,
                 cv::Scalar(255, 255, 255), 2);
 
