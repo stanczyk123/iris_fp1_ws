@@ -39,6 +39,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <cv_bridge/cv_bridge.hpp>
 
@@ -48,6 +49,11 @@ namespace
 {
 const std::string CAMERA_TOPIC = "/catvehicle/camera_front/image_raw_front";
 const std::string TARGET_TOPIC = "/turn_target";
+
+// Jenis garis pembatas lajur. Dipakai node master untuk memutuskan ke sisi
+// mana boleh menghindar: garis putus-putus memisahkan dua lajur dan boleh
+// dilintasi, garis solid adalah tepi jalan dan tidak boleh dilintasi.
+const std::string LANE_INFO_TOPIC = "/lane_info";
 
 const std::string WIN_TUNING = "Tuning";
 const std::string WIN_RAW    = "1 - Raw Camera";
@@ -87,12 +93,15 @@ public:
       std::bind(&VisionNode::imageCallback, this, std::placeholders::_1));
 
     pub_ = this->create_publisher<geometry_msgs::msg::Point>(TARGET_TOPIC, 10);
+    pub_info_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+      LANE_INFO_TOPIC, 10);
 
     buildTuningWindow();
 
     RCLCPP_INFO(this->get_logger(), "Vision node aktif.");
     RCLCPP_INFO(this->get_logger(), "  subscribe : %s", CAMERA_TOPIC.c_str());
-    RCLCPP_INFO(this->get_logger(), "  publish   : %s", TARGET_TOPIC.c_str());
+    RCLCPP_INFO(this->get_logger(), "  publish   : %s, %s",
+                TARGET_TOPIC.c_str(), LANE_INFO_TOPIC.c_str());
     RCLCPP_INFO(this->get_logger(), "Menunggu gambar pertama...");
   }
 
@@ -127,7 +136,7 @@ private:
     // putus-putus. Pita tipis sering jatuh tepat di jeda antar segmen.
     p_.band_h = 30;
 
-    p_.lebar_lajur = 24;
+    p_.lebar_lajur = 32;
     p_.min_piksel  = 60;
 
     cv::createTrackbar("H min", WIN_TUNING, &p_.h_min, 179);
@@ -473,6 +482,29 @@ private:
     point.z = valid ? 1.0 : 0.0;
     pub_->publish(point);
 
+    // Jenis garis di tiap sisi: 0 = tidak terdeteksi, 1 = putus-putus, 2 = solid
+    auto jenis = [&](int idx) -> float {
+      if (idx < 0 || idx >= static_cast<int>(garis.size())) return 0.0f;
+      return garis[idx].solid ? 2.0f : 1.0f;
+    };
+
+    // Posisi garis, bukan hanya jenisnya. Node master memakainya sebagai
+    // batas keras: target kemudi tidak boleh berada di seberang garis solid.
+    auto posisi = [&](int idx) -> float {
+      if (idx < 0 || idx >= static_cast<int>(garis.size())) return -1.0f;
+      return static_cast<float>(garis[idx].x);
+    };
+
+    auto info = std_msgs::msg::Float32MultiArray();
+    info.data = {static_cast<float>(target_x),
+                 valid ? 1.0f : 0.0f,
+                 jenis(idx_kiri),
+                 jenis(idx_kanan),
+                 static_cast<float>(lebar_terukur_),
+                 posisi(idx_kiri),
+                 posisi(idx_kanan)};
+    pub_info_->publish(info);
+
     // ---------------- Tampilan ----------------
     cv::Mat bev_color;
     cv::cvtColor(bev, bev_color, cv::COLOR_GRAY2BGR);
@@ -566,6 +598,7 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_;
   rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_info_;
 
   TuningParams p_;
   unsigned long frame_count_;

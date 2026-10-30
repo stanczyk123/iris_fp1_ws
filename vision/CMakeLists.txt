@@ -32,7 +32,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
 add_executable(lidar_node src/lidar_node.cpp)
-ament_target_dependencies(lidar_node rclcpp sensor_msgs std_msgs)
+ament_target_dependencies(lidar_node rclcpp sensor_msgs std_msgs geometry_msgs)
 
 add_executable(vision_node src/vision_node.cpp)
 ament_target_dependencies(vision_node rclcpp sensor_msgs geometry_msgs cv_bridge OpenCV)

@@ -96,7 +96,7 @@ Tunggu Gazebo terbuka penuh. Pastikan `Real Time Factor` sekitar 1.00
 ### Terminal 2 — UDP receiver
 
 ```bash
-cd ~/iris_fp1_ws
+cd ~/iris_fp1_ws && source install/setup.bash
 ros2 run communication udp_receiver_node --ros-args -p listen_port:=12152
 ```
 
@@ -105,21 +105,21 @@ Tunggu sampai muncul `Paket pertama diterima!`
 ### Terminal 3 — UDP sender
 
 ```bash
-cd ~/iris_fp1_ws
+cd ~/iris_fp1_ws && source install/setup.bash
 ros2 run communication udp_sender_node --ros-args -p sim_port:=12151
 ```
 
 ### Terminal 4 — LiDAR
 
 ```bash
-cd ~/iris_fp1_ws
-ros2 run vision lidar_node
+cd ~/iris_fp1_ws && source install/setup.bash
+ros2 run vision lidar_node --ros-args -p lebar_koridor:=2.2
 ```
 
 ### Terminal 5 — Vision
 
 ```bash
-cd ~/iris_fp1_ws
+cd ~/iris_fp1_ws && source install/setup.bash
 ros2 run vision vision_node
 ```
 
@@ -129,7 +129,7 @@ adalah target belok yang sedang diikuti.
 ### Terminal 6 — Master
 
 ```bash
-cd ~/iris_fp1_ws
+cd ~/iris_fp1_ws && source install/setup.bash
 ros2 run master master_node --ros-args -p mode:=follow
 ```
 
